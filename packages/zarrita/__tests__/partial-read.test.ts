@@ -160,6 +160,14 @@ describe("partial reads of uncompressed chunks", () => {
 		}
 	});
 
+	it("handles a store that ignores the range and sends the whole chunk", async () => {
+		let store = new RangeStore();
+		store.getRange = (key: AbsolutePath) => store.map.get(key);
+		let arr = await int16Array(store, [100, 4], [100, 4]);
+		let result = await zarr.get(arr, [zarr.slice(50, 52), 0]);
+		expect(Array.from(result.data)).toEqual([200, 204]);
+	});
+
 	it("handles big-endian data", async () => {
 		let store = new RangeStore();
 		let arr = await int16Array(

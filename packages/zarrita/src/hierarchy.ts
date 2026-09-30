@@ -193,12 +193,15 @@ function createChunkRowReader<D extends DataType>(
 	let rowBytes = itemSize * rowShape.reduce((a, b) => a * b, 1);
 	return async (chunkCoords, first, stop, options) => {
 		let chunkPath = location.resolve(shared.encodeChunkKey(chunkCoords)).path;
-		let bytes = await store.getRange?.(
-			chunkPath,
-			{ offset: first * rowBytes, length: (stop - first) * rowBytes },
-			options,
-		);
+		let offset = first * rowBytes;
+		let length = (stop - first) * rowBytes;
+		let bytes = await store.getRange?.(chunkPath, { offset, length }, options);
 		if (!bytes) return undefined;
+		if (bytes.length > length) {
+			// The store sent the whole chunk, as an HTTP server that ignores
+			// the Range header does.
+			bytes = bytes.subarray(offset, offset + length);
+		}
 		return createCodecPipeline({
 			dataType: metadata.data_type,
 			shape: [stop - first, ...rowShape],
