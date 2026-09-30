@@ -160,6 +160,51 @@ function createContext<D extends DataType>(
 			let chunkPath = location.resolve(chunkKey).path;
 			return location.store.get(chunkPath, options);
 		},
+		getChunkRows: createChunkRowReader(location, metadata, sharedContext),
+	};
+}
+
+/**
+ * For an uncompressed array whose store supports range requests, return a
+ * function that reads rows `[first, stop)` of a chunk along its first axis
+ * without fetching the rest of the chunk. An uncompressed chunk is stored in
+ * C order, so those rows are one contiguous run of bytes. Returns undefined
+ * when the array has any codec besides `bytes`, the data type has no fixed
+ * size, or the store cannot serve ranges.
+ */
+function createChunkRowReader<D extends DataType>(
+	location: Location<Readable>,
+	metadata: ArrayMetadata<D>,
+	shared: {
+		encodeChunkKey(chunkCoords: number[]): string;
+		TypedArray: TypedArrayConstructor<D>;
+	},
+): ArrayContext<D>["getChunkRows"] {
+	let store = location.store;
+	if (typeof store.getRange !== "function") return undefined;
+	if (metadata.codecs.length !== 1 || metadata.codecs[0].name !== "bytes") {
+		return undefined;
+	}
+	let chunkShape = metadata.chunk_grid.configuration.chunk_shape;
+	let itemSize = (new shared.TypedArray(0) as { BYTES_PER_ELEMENT?: number })
+		.BYTES_PER_ELEMENT;
+	if (chunkShape.length === 0 || !itemSize) return undefined;
+	let rowShape = chunkShape.slice(1);
+	let rowBytes = itemSize * rowShape.reduce((a, b) => a * b, 1);
+	return async (chunkCoords, first, stop, options) => {
+		let chunkPath = location.resolve(shared.encodeChunkKey(chunkCoords)).path;
+		let bytes = await store.getRange?.(
+			chunkPath,
+			{ offset: first * rowBytes, length: (stop - first) * rowBytes },
+			options,
+		);
+		if (!bytes) return undefined;
+		return createCodecPipeline({
+			dataType: metadata.data_type,
+			shape: [stop - first, ...rowShape],
+			codecs: metadata.codecs,
+			fillValue: metadata.fill_value,
+		}).decode(bytes);
 	};
 }
 
@@ -188,6 +233,17 @@ interface ArrayContext<D extends DataType> {
 	): Promise<Uint8Array | undefined>;
 	/** The chunk shape for this array. */
 	chunkShape: number[];
+	/**
+	 * Read rows `[first, stop)` of a chunk along its first axis, for arrays
+	 * whose chunks can be read in part. Resolves to undefined for a chunk
+	 * that was never written.
+	 */
+	getChunkRows?(
+		chunkCoords: number[],
+		first: number,
+		stop: number,
+		options?: GetOptions,
+	): Promise<Chunk<D> | undefined>;
 }
 
 export class Array<
