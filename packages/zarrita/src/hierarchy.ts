@@ -160,29 +160,29 @@ function createContext<D extends DataType>(
 			let chunkPath = location.resolve(chunkKey).path;
 			return location.store.get(chunkPath, options);
 		},
-		getChunkRows: createChunkRowReader(location, metadata, sharedContext),
+		getChunkBlock: createChunkBlockReader(location, metadata, sharedContext),
 	};
 }
 
 /**
  * For an uncompressed array whose store supports range requests, return a
- * function that reads rows `[first, stop)` of a chunk along its first axis
- * without fetching the rest of the chunk. An uncompressed chunk is stored in
- * C order, so those rows are one contiguous run of bytes. Returns undefined
- * when the array has any codec besides `bytes`, the data type has no fixed
- * size, or the store cannot serve ranges.
+ * function that reads a block of a chunk without fetching the rest of the
+ * chunk. An uncompressed chunk is stored in C order, so a block that spans
+ * whole trailing axes is one contiguous run of bytes. Returns undefined when
+ * the array has any codec besides `bytes`, the data type has no fixed size,
+ * or the store cannot serve ranges.
  *
  * An array with no codecs is also uncompressed: that is how a little-endian
  * v2 array with no compressor or filters is represented.
  */
-function createChunkRowReader<D extends DataType>(
+function createChunkBlockReader<D extends DataType>(
 	location: Location<Readable>,
 	metadata: ArrayMetadata<D>,
 	shared: {
 		encodeChunkKey(chunkCoords: number[]): string;
 		TypedArray: TypedArrayConstructor<D>;
 	},
-): ArrayContext<D>["getChunkRows"] {
+): ArrayContext<D>["getChunkBlock"] {
 	let store = location.store;
 	if (typeof store.getRange !== "function") return undefined;
 	let codecs = metadata.codecs;
@@ -193,13 +193,12 @@ function createChunkRowReader<D extends DataType>(
 	let itemSize = (new shared.TypedArray(0) as { BYTES_PER_ELEMENT?: number })
 		.BYTES_PER_ELEMENT;
 	if (chunkShape.length === 0 || !itemSize) return undefined;
-	let rowShape = chunkShape.slice(1);
-	let rowBytes = itemSize * rowShape.reduce((a, b) => a * b, 1);
-	let chunkBytes = chunkShape[0] * rowBytes;
-	return async (chunkCoords, first, stop, options) => {
+	let itemBytes = itemSize;
+	let chunkBytes = itemBytes * chunkShape.reduce((a, b) => a * b, 1);
+	return async (chunkCoords, start, shape, options) => {
 		let chunkPath = location.resolve(shared.encodeChunkKey(chunkCoords)).path;
-		let offset = first * rowBytes;
-		let length = (stop - first) * rowBytes;
+		let offset = start * itemBytes;
+		let length = itemBytes * shape.reduce((a, b) => a * b, 1);
 		let bytes = await store.getRange?.(chunkPath, { offset, length }, options);
 		if (!bytes) return undefined;
 		// A store may not honor the range it was given. The length of what it
@@ -219,7 +218,7 @@ function createChunkRowReader<D extends DataType>(
 		}
 		return createCodecPipeline({
 			dataType: metadata.data_type,
-			shape: [stop - first, ...rowShape],
+			shape,
 			codecs: metadata.codecs,
 			fillValue: metadata.fill_value,
 		}).decode(bytes);
@@ -252,14 +251,15 @@ interface ArrayContext<D extends DataType> {
 	/** The chunk shape for this array. */
 	chunkShape: number[];
 	/**
-	 * Read rows `[first, stop)` of a chunk along its first axis, for arrays
-	 * whose chunks can be read in part. Resolves to undefined for a chunk
-	 * that was never written.
+	 * Read a block of a chunk, for arrays whose chunks can be read in part.
+	 * The block starts `start` items into the chunk in C order and has shape
+	 * `shape`, whose trailing axes are whole axes of the chunk. Resolves to
+	 * undefined for a chunk that was never written.
 	 */
-	getChunkRows?(
+	getChunkBlock?(
 		chunkCoords: number[],
-		first: number,
-		stop: number,
+		start: number,
+		shape: number[],
 		options?: GetOptions,
 	): Promise<Chunk<D> | undefined>;
 }

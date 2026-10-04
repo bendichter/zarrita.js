@@ -74,11 +74,122 @@ describe("partial reads of uncompressed chunks", () => {
 		]);
 	});
 
-	it("reads a single row for a single element", async () => {
+	it("reads a single item for a single element", async () => {
 		let store = new RangeStore();
 		let arr = await int16Array(store, [10_000, 10], [10_000, 10]);
 		expect(await zarr.get(arr, [777, 5])).toBe((777 * 10 + 5) % 30000);
-		expect(bytesRead(store)).toBe(20);
+		expect(store.reads).toEqual([
+			{ key: "/a/c/0/0", range: { offset: 15_550, length: 2 }, bytes: 2 },
+		]);
+	});
+
+	describe("a selection that reads one index along the leading axes", () => {
+		// A [50, 40, 30] chunk of int16: a frame is 2400 bytes and a row is 60.
+		let frame = 7 * 2400;
+		it.each<[string, (zarr.Slice | number | null)[], number, number]>([
+			[
+				"rows of a frame",
+				[7, zarr.slice(10, 20), zarr.slice(5, 9)],
+				frame + 600,
+				600,
+			],
+			[
+				"rows of a frame, every column",
+				[7, zarr.slice(10, 20), null],
+				frame + 600,
+				600,
+			],
+			["columns of a row", [7, 10, zarr.slice(5, 9)], frame + 610, 8],
+			["a point", [7, 10, 5], frame + 610, 2],
+			[
+				"slices of length one",
+				[zarr.slice(7, 8), zarr.slice(10, 11), zarr.slice(5, 9)],
+				frame + 610,
+				8,
+			],
+			["a whole frame", [7, null, zarr.slice(5, 9)], frame, 2400],
+			[
+				"two frames, read whole",
+				[zarr.slice(7, 9), zarr.slice(10, 20), zarr.slice(5, 9)],
+				frame,
+				4800,
+			],
+		])("reads %s", async (_, selection, offset, length) => {
+			let store = new RangeStore();
+			let shape = [50, 40, 30];
+			let partial = await int16Array(store, shape, shape);
+			let whole = await int16Array(new Map(), shape, shape); // no getRange
+			expect(await zarr.get(partial, selection)).toEqual(
+				await zarr.get(whole, selection),
+			);
+			expect(store.reads).toEqual([
+				{ key: "/a/c/0/0/0", range: { offset, length }, bytes: length },
+			]);
+		});
+
+		it("returns the same values as whole-chunk reads", async () => {
+			let cases: [number[], number[]][] = [
+				[
+					[6, 5, 4],
+					[6, 5, 4],
+				],
+				[
+					[7, 6, 5],
+					[3, 4, 2],
+				],
+				[
+					[1, 5, 4],
+					[1, 5, 4],
+				],
+				[
+					[9, 1, 3],
+					[4, 1, 3],
+				],
+				[
+					[8, 3],
+					[8, 3],
+				],
+			];
+			// A small deterministic generator, so failures are reproducible.
+			let seed = 1;
+			let random = (n: number) => {
+				seed = (seed * 1103515245 + 12345) % 2147483648;
+				return seed % n;
+			};
+			let selector = (size: number) => {
+				let start = random(size);
+				let kind = random(4);
+				if (kind === 0) return start;
+				if (kind === 1) return zarr.slice(start, start + 1);
+				if (kind === 2) return null;
+				let stop = start + random(size - start + 1);
+				return zarr.slice(start, stop, 1 + random(3));
+			};
+			for (let [shape, chunkShape] of cases) {
+				let partial = await int16Array(new RangeStore(), shape, chunkShape);
+				let whole = await int16Array(new Map(), shape, chunkShape);
+				for (let i = 0; i < 300; i++) {
+					let selection = shape.map(selector);
+					expect(
+						await zarr.get(partial, selection),
+						JSON.stringify({ shape, chunkShape, selection }),
+					).toEqual(await zarr.get(whole, selection));
+				}
+			}
+		});
+
+		it("reads a chunk that was never written as the fill value", async () => {
+			let arr = await zarr.create(zarr.root(new RangeStore()).resolve("/a"), {
+				shape: [10, 6, 4],
+				chunkShape: [10, 6, 4],
+				dtype: "int16",
+				codecs: BYTES,
+				fillValue: 7,
+			});
+			let result = await zarr.get(arr, [3, zarr.slice(1, 3), null]);
+			expect(result.shape).toEqual([2, 4]);
+			expect(Array.from(result.data)).toEqual(new Array(8).fill(7));
+		});
 	});
 
 	it("reads from the first to the last row of a stepped slice", async () => {
@@ -186,6 +297,9 @@ describe("partial reads of uncompressed chunks", () => {
 		for (let [start, stop] of selections) {
 			let result = await zarr.get(arr, [zarr.slice(start, stop), 0]);
 			expect(Array.from(result.data)).toEqual([start * 4, start * 4 + 4]);
+			// a single row, narrowed to two of its columns
+			let row = await zarr.get(arr, [start, zarr.slice(1, 3)]);
+			expect(Array.from(row.data)).toEqual([start * 4 + 1, start * 4 + 2]);
 		}
 	});
 
