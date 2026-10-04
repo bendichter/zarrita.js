@@ -90,9 +90,12 @@ export async function get<
 
 	let queue = opts.createQueue?.() ?? createQueue();
 	// Uncompressed chunks can be read in part: only the rows a selection touches.
-	let getChunkRows = opts.useSharedArrayBuffer
-		? undefined
-		: context.getChunkRows;
+	// An array extension that overrides `getChunk` must see every chunk read,
+	// so those arrays read whole chunks through it.
+	let getChunkRows =
+		opts.useSharedArrayBuffer || overridesGetChunk(arr)
+			? undefined
+			: context.getChunkRows;
 	for (const { chunkCoords, mapping } of indexer) {
 		queue.add(async () => {
 			signal?.throwIfAborted();
@@ -127,6 +130,14 @@ export async function get<
 	// If the final out shape is empty (point selection), return a scalar.
 	// @ts-expect-error - TS can't narrow this conditional type
 	return indexer.shape.length === 0 ? unwrap(out.data, 0) : out;
+}
+
+/**
+ * Whether `getChunk` was replaced on this array, as an array extension does.
+ * `Array` defines `getChunk` on its prototype, so an own property is an override.
+ */
+function overridesGetChunk(arr: object): boolean {
+	return Object.getOwnPropertyDescriptor(arr, "getChunk") !== undefined;
 }
 
 /**

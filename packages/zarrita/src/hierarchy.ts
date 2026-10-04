@@ -171,6 +171,9 @@ function createContext<D extends DataType>(
  * C order, so those rows are one contiguous run of bytes. Returns undefined
  * when the array has any codec besides `bytes`, the data type has no fixed
  * size, or the store cannot serve ranges.
+ *
+ * An array with no codecs is also uncompressed: that is how a little-endian
+ * v2 array with no compressor or filters is represented.
  */
 function createChunkRowReader<D extends DataType>(
 	location: Location<Readable>,
@@ -182,7 +185,8 @@ function createChunkRowReader<D extends DataType>(
 ): ArrayContext<D>["getChunkRows"] {
 	let store = location.store;
 	if (typeof store.getRange !== "function") return undefined;
-	if (metadata.codecs.length !== 1 || metadata.codecs[0].name !== "bytes") {
+	let codecs = metadata.codecs;
+	if (codecs.length > 1 || codecs.some((codec) => codec.name !== "bytes")) {
 		return undefined;
 	}
 	let chunkShape = metadata.chunk_grid.configuration.chunk_shape;
@@ -191,16 +195,27 @@ function createChunkRowReader<D extends DataType>(
 	if (chunkShape.length === 0 || !itemSize) return undefined;
 	let rowShape = chunkShape.slice(1);
 	let rowBytes = itemSize * rowShape.reduce((a, b) => a * b, 1);
+	let chunkBytes = chunkShape[0] * rowBytes;
 	return async (chunkCoords, first, stop, options) => {
 		let chunkPath = location.resolve(shared.encodeChunkKey(chunkCoords)).path;
 		let offset = first * rowBytes;
 		let length = (stop - first) * rowBytes;
 		let bytes = await store.getRange?.(chunkPath, { offset, length }, options);
 		if (!bytes) return undefined;
-		if (bytes.length > length) {
-			// The store sent the whole chunk, as an HTTP server that ignores
-			// the Range header does.
+		// A store may not honor the range it was given. The length of what it
+		// sent tells which bytes those are.
+		if (bytes.length === length) {
+			// The requested range.
+		} else if (bytes.length === chunkBytes) {
+			// The whole chunk, as an HTTP server that ignores the Range header sends.
 			bytes = bytes.subarray(offset, offset + length);
+		} else if (bytes.length === chunkBytes - offset) {
+			// Everything from the start of the range to the end of the chunk.
+			bytes = bytes.subarray(0, length);
+		} else {
+			throw new Error(
+				`Requested ${length} bytes at offset ${offset} of a ${chunkBytes} byte chunk, but the store returned ${bytes.length} bytes.`,
+			);
 		}
 		return createCodecPipeline({
 			dataType: metadata.data_type,

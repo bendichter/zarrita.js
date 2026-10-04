@@ -160,12 +160,86 @@ describe("partial reads of uncompressed chunks", () => {
 		}
 	});
 
-	it("handles a store that ignores the range and sends the whole chunk", async () => {
+	it.each([
+		[
+			"ignores the range and sends the whole chunk",
+			(value: Uint8Array) => value,
+		],
+		[
+			"ignores the end of the range",
+			(value: Uint8Array, range: { offset: number }) =>
+				value.subarray(range.offset),
+		],
+	])("handles a store that %s", async (_, serve) => {
 		let store = new RangeStore();
-		store.getRange = (key: AbsolutePath) => store.map.get(key);
+		store.getRange = (key: AbsolutePath, range: RangeQuery) => {
+			let value = store.map.get(key);
+			return value && "offset" in range ? serve(value, range) : value;
+		};
 		let arr = await int16Array(store, [100, 4], [100, 4]);
-		let result = await zarr.get(arr, [zarr.slice(50, 52), 0]);
-		expect(Array.from(result.data)).toEqual([200, 204]);
+		let selections: [number, number][] = [
+			[0, 2],
+			[10, 12],
+			[50, 52],
+			[98, 100],
+		];
+		for (let [start, stop] of selections) {
+			let result = await zarr.get(arr, [zarr.slice(start, stop), 0]);
+			expect(Array.from(result.data)).toEqual([start * 4, start * 4 + 4]);
+		}
+	});
+
+	it("throws when a store sends an unexpected number of bytes", async () => {
+		let store = new RangeStore();
+		store.getRange = (key: AbsolutePath, range: RangeQuery) => {
+			let value = store.map.get(key);
+			if (!value || !("offset" in range)) return value;
+			return value.subarray(range.offset, range.offset + range.length - 1);
+		};
+		let arr = await int16Array(store, [100, 4], [100, 4]);
+		await expect(zarr.get(arr, [zarr.slice(50, 52), 0])).rejects.toThrow(
+			"the store returned 15 bytes",
+		);
+	});
+
+	it("reads whole chunks through an extension that overrides getChunk", async () => {
+		let store = new RangeStore();
+		let calls = 0;
+		let withNegation = zarr.defineArrayExtension((array) => ({
+			async getChunk(coords: number[], options?: zarr.GetOptions) {
+				calls++;
+				let chunk = await array.getChunk(coords, options);
+				let data = (chunk.data as Int16Array).map((x) => -x);
+				return { ...chunk, data };
+			},
+		}));
+		let arr = withNegation(await int16Array(store, [100, 4], [100, 4]));
+		let result = await zarr.get(arr, [zarr.slice(10, 12), 0]);
+		expect(Array.from(result.data as Int16Array)).toEqual([-40, -44]);
+		expect(calls).toBe(1);
+		expect(store.reads).toEqual([{ key: "/a/c/0/0", bytes: 800 }]);
+	});
+
+	it("reads part of a chunk through an extension that leaves getChunk alone", async () => {
+		let store = new RangeStore();
+		let withLabel = zarr.defineArrayExtension(() => ({ label: "a" }));
+		let arr = withLabel(await int16Array(store, [100, 4], [100, 4]));
+		let result = await zarr.get(arr, [zarr.slice(10, 12), 0]);
+		expect(Array.from(result.data)).toEqual([40, 44]);
+		expect(bytesRead(store)).toBe(2 * 4 * 2);
+	});
+
+	it("reads transposed chunks whole", async () => {
+		let store = new RangeStore();
+		let arr = await int16Array(
+			store,
+			[100, 4],
+			[100, 4],
+			[{ name: "transpose", configuration: { order: [1, 0] } }, ...BYTES],
+		);
+		let result = await zarr.get(arr, [zarr.slice(10, 12), 0]);
+		expect(Array.from(result.data)).toEqual([40, 44]);
+		expect(store.reads).toEqual([{ key: "/a/c/0/0", bytes: 800 }]);
 	});
 
 	it("handles big-endian data", async () => {
@@ -179,5 +253,86 @@ describe("partial reads of uncompressed chunks", () => {
 		let result = await zarr.get(arr, [zarr.slice(100, 103), 1]);
 		expect(Array.from(result.data)).toEqual([301, 304, 307]);
 		expect(bytesRead(store)).toBe(3 * 3 * 2);
+	});
+
+	describe("v2 arrays", () => {
+		/** A [100, 4] v2 array with one uncompressed chunk holding `bytes`. */
+		async function v2Array(
+			store: RangeStore,
+			dtype: string,
+			order: "C" | "F",
+			bytes: Uint8Array,
+		) {
+			let meta = {
+				zarr_format: 2,
+				shape: [100, 4],
+				chunks: [100, 4],
+				dtype,
+				compressor: null,
+				filters: null,
+				fill_value: 0,
+				order,
+			};
+			store.set("/a/.zarray", new TextEncoder().encode(JSON.stringify(meta)));
+			store.set("/a/0.0", bytes);
+			let arr = await zarr.open.v2(zarr.root(store).resolve("/a"), {
+				kind: "array",
+			});
+			store.reads.length = 0;
+			return arr;
+		}
+
+		/** Element `[row, col]` is `row * 4 + col`, laid out in the given order. */
+		function int16Bytes(littleEndian: boolean, order: "C" | "F" = "C") {
+			let bytes = new Uint8Array(800);
+			let view = new DataView(bytes.buffer);
+			for (let row = 0; row < 100; row++) {
+				for (let col = 0; col < 4; col++) {
+					let index = order === "C" ? row * 4 + col : col * 100 + row;
+					view.setInt16(index * 2, row * 4 + col, littleEndian);
+				}
+			}
+			return bytes;
+		}
+
+		it.each([
+			["<i2", true],
+			[">i2", false],
+		])("reads only the needed rows of a %s array", async (dtype, little) => {
+			let store = new RangeStore();
+			let arr = await v2Array(store, dtype, "C", int16Bytes(little));
+			let result = await zarr.get(arr, [zarr.slice(10, 12), 0]);
+			expect(Array.from(result.data as Int16Array)).toEqual([40, 44]);
+			expect(store.reads).toEqual([
+				{ key: "/a/0.0", range: { offset: 80, length: 16 }, bytes: 16 },
+			]);
+		});
+
+		it("reads F order chunks whole", async () => {
+			let store = new RangeStore();
+			let arr = await v2Array(store, "<i2", "F", int16Bytes(true, "F"));
+			let result = await zarr.get(arr, [zarr.slice(10, 12), 0]);
+			expect(Array.from(result.data as Int16Array)).toEqual([40, 44]);
+			expect(store.reads).toEqual([{ key: "/a/0.0", bytes: 800 }]);
+		});
+
+		it("reads only the needed rows of a fixed-length string array", async () => {
+			let store = new RangeStore();
+			let text = Array.from({ length: 400 }, (_, i) =>
+				String(i).padStart(3, "0"),
+			).join("");
+			let arr = await v2Array(
+				store,
+				"|S3",
+				"C",
+				new TextEncoder().encode(text),
+			);
+			let result = await zarr.get(arr, [zarr.slice(10, 12), 0]);
+			expect(Array.from(result.data as Iterable<string>)).toEqual([
+				"040",
+				"044",
+			]);
+			expect(bytesRead(store)).toBe(2 * 4 * 3);
+		});
 	});
 });
