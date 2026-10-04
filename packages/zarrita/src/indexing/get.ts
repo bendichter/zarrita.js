@@ -89,22 +89,20 @@ export async function get<
 	);
 
 	let queue = opts.createQueue?.() ?? createQueue();
-	// Uncompressed chunks can be read in part: only the rows a selection touches.
+	// Uncompressed chunks can be read in part: only the block a selection touches.
 	// An array extension that overrides `getChunk` must see every chunk read,
 	// so those arrays read whole chunks through it.
-	let getChunkRows =
+	let getChunkBlock =
 		opts.useSharedArrayBuffer || overridesGetChunk(arr)
 			? undefined
-			: context.getChunkRows;
+			: context.getChunkBlock;
 	for (const { chunkCoords, mapping } of indexer) {
 		queue.add(async () => {
 			signal?.throwIfAborted();
-			let rows =
-				getChunkRows && selectedRows(mapping[0], context.chunkShape[0]);
-			if (getChunkRows && rows) {
-				let [first, stop] = rows;
-				let shape = [stop - first, ...context.chunkShape.slice(1)];
-				let part = await getChunkRows(chunkCoords, first, stop, { signal });
+			let block = getChunkBlock && selectedBlock(mapping, context.chunkShape);
+			if (getChunkBlock && block) {
+				let { start, shape } = block;
+				let part = await getChunkBlock(chunkCoords, start, shape, { signal });
 				if (!part) {
 					let data = new context.TypedArray(shape.reduce((a, b) => a * b, 1));
 					// @ts-expect-error: TS can't infer that `fillValue` is union (assumes never) but this is ok
@@ -112,7 +110,7 @@ export async function get<
 					part = { data, shape, stride: context.getStrides(shape) };
 				}
 				let chunk = setter.prepare(part.data, part.shape, part.stride);
-				setter.setFromChunk(out, chunk, shiftRows(mapping, first));
+				setter.setFromChunk(out, chunk, block.mapping);
 				return;
 			}
 			let { data, shape, stride } = await arr.getChunk(
@@ -141,44 +139,65 @@ function overridesGetChunk(arr: object): boolean {
 }
 
 /**
- * The first row along axis 0 that a chunk projection reads and one past the
- * last, or undefined when it reads every row or the rows are unknown.
+ * The contiguous block of a C-order chunk that a selection reads.
+ *
+ * Along the first axis the block spans the first to the last row the
+ * selection reads. If that is a single row, the block is narrowed in the same
+ * way along the next axis, and so on. The axes after that are whole.
+ *
+ * `start` is where the block begins in the chunk, in items. `shape` has as
+ * many axes as the chunk; the axes the block was narrowed to a single index
+ * along have length 1. `mapping` is the projections relative to the block.
+ * Returns undefined when the block is the whole chunk.
  */
-function selectedRows(
-	projection: Projection,
-	chunkRows: number,
-): [number, number] | undefined {
-	let first: number;
-	let stop: number;
-	if (typeof projection.from === "number") {
-		first = projection.from;
-		stop = first + 1;
-	} else if (globalThis.Array.isArray(projection.from)) {
-		let [start, end, step] = projection.from;
-		if (step <= 0 || end <= start) return undefined;
-		first = start;
-		stop = start + (Math.ceil((end - start) / step) - 1) * step + 1;
-	} else {
-		return undefined;
+function selectedBlock(
+	mapping: Projection[],
+	chunkShape: number[],
+): { start: number; shape: number[]; mapping: Projection[] } | undefined {
+	let start = 0;
+	let shape = [...chunkShape];
+	let shifted = [...mapping];
+	for (let axis = 0; axis < mapping.length; axis++) {
+		let range = selectedRange(mapping[axis]);
+		if (!range) break;
+		let [first, stop] = range;
+		let rowItems = chunkShape.slice(axis + 1).reduce((a, b) => a * b, 1);
+		start += first * rowItems;
+		shape[axis] = stop - first;
+		shifted[axis] = shiftProjection(mapping[axis], first);
+		if (stop - first > 1) break;
 	}
-	return first === 0 && stop === chunkRows ? undefined : [first, stop];
+	if (shape.every((size, axis) => size === chunkShape[axis])) return undefined;
+	return { start, shape, mapping: shifted };
 }
 
-/** The projections relative to the rows read, which start at row `first`. */
-function shiftRows(mapping: Projection[], first: number): Projection[] {
-	let [head, ...rest] = mapping;
-	if (typeof head.from === "number") {
-		return [{ from: head.from - first, to: null }, ...rest];
+/**
+ * The first index along an axis that a chunk projection reads and one past
+ * the last, or undefined when the indices are unknown.
+ */
+function selectedRange(projection: Projection): [number, number] | undefined {
+	if (typeof projection.from === "number") {
+		return [projection.from, projection.from + 1];
+	}
+	if (globalThis.Array.isArray(projection.from)) {
+		let [start, end, step] = projection.from;
+		if (step <= 0 || end <= start) return undefined;
+		return [start, start + (Math.ceil((end - start) / step) - 1) * step + 1];
+	}
+	return undefined;
+}
+
+/** A projection relative to the indices read, which start at index `first`. */
+function shiftProjection(projection: Projection, first: number): Projection {
+	if (typeof projection.from === "number") {
+		return { from: projection.from - first, to: null };
 	}
 	if (
-		globalThis.Array.isArray(head.from) &&
-		globalThis.Array.isArray(head.to)
+		globalThis.Array.isArray(projection.from) &&
+		globalThis.Array.isArray(projection.to)
 	) {
-		let [start, stop, step] = head.from;
-		return [
-			{ from: [start - first, stop - first, step], to: head.to },
-			...rest,
-		];
+		let [start, stop, step] = projection.from;
+		return { from: [start - first, stop - first, step], to: projection.to };
 	}
-	return mapping;
+	return projection;
 }
